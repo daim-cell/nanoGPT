@@ -32,6 +32,7 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+# Global config values will be overridden by the configurator, which reads command line arguments and config files.
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
@@ -79,6 +80,7 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
+# Checks if the training will be done on multi-GPU (DDP) and sets up the process group, device, seeds, etc.
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
     init_process_group(backend=backend)
@@ -112,6 +114,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
+# To get data for training and validation, use numpy memmaps. This is a fast and memory-efficient way to read large datasets that don't fit into RAM.
 data_dir = os.path.join('data', dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
@@ -120,6 +123,7 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    # Introduces shuffling
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
@@ -146,6 +150,8 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+
+# Setting up the model based on the initialization method specified in the config. This can be from scratch, resuming from a checkpoint, or initializing from pretrained GPT-2 weights. This can also help in finetuning GPT-2.
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -196,6 +202,7 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
+# Uses a custom optimizer, need to study model.py to understand why he doesn't just use torch.optim.AdamW. The configure_optimizers method in the GPT class likely sets up the optimizer with specific parameters.
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
@@ -227,6 +234,7 @@ def estimate_loss():
     model.train()
     return out
 
+# Custom learning rate decay scheduler. This implements a cosine decay with a linear warmup. The learning rate starts at 0, increases linearly to the maximum learning rate over the course of warmup_iters iterations, and then decays following a cosine schedule down to min_lr by lr_decay_iters iterations. After lr_decay_iters, it stays at min_lr.
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -260,6 +268,7 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
+    # Checkpoint in validation to save model after some progress has been made
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -289,6 +298,8 @@ while True:
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
+    # Applied gradient accumulation to simulate larger batch sizes. The loss is scaled down by the number of gradient accumulation steps to ensure that the overall scale of the gradients remains consistent.
+    # Takes 40 batches to accumulate gradients before update
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -302,13 +313,18 @@ while True:
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
+        # Makes the gradients big or small depending on loss, mainly handles underflow
         scaler.scale(loss).backward()
     # clip the gradient
     if grad_clip != 0.0:
+        # unscale the gradients of the optimizer's assigned params in-place
         scaler.unscale_(optimizer)
+        # Every gradient is multiplied by (grad_clip / max_norm) if the total norm of the gradients exceeds grad_clip. This helps prevent exploding gradients.
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
+    # Makes the model updates if inf or nan does not exist otherwise skips the update and scales down the next iteration's gradients
     scaler.step(optimizer)
+    # updates the scale factor. If the gradients overflowed, scaler.step() would have skipped the optimizer step, and scaler.update() will adjust the scale factor to try to prevent this in the future.
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
