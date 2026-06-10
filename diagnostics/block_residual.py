@@ -11,13 +11,14 @@ B, T, C = 2, 16, 128
 x = torch.randn(B, T, C)
 
 # expect: (2, 16, 128) — starting shape
-print(f"Input shape:                    {x.shape}  [B, T, n_embd]")
+print(f"Input shape:                    {x.shape}  [B(Batch_size), T(Context_length), n_embd(Embedding_dim)]")
 
 with torch.no_grad():
     # LayerNorm normalizes before attention (pre-norm); shape unchanged
     # expect: (2, 16, 128)
     attn_out = block.attn(block.ln_1(x))
     print(f"After attention (pre-residual): {attn_out.shape}")
+    print(f"{block.attn.c_attn}")
 
     # Residual connection adds back the original x; shape unchanged
     # expect: (2, 16, 128)

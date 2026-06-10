@@ -27,7 +27,7 @@ with torch.no_grad():
     # expect: True — both see the mutation because they point to the same storage
     print(f"Mutation visible through lm_head: {lm_head[0, 0].item() == 999.0}")
     wte[0, 0] = original  # restore
-
+# This reduces parameters which are usually a lot (vocab_size, n_embd) and saves memory, but also means that the input embedding and output projection are forced to be the same. 
 print(f"\nvocab_size = {wte.shape[0]}  (GPT-2 uses 50257 tokens)")
 print(f"n_embd     = {wte.shape[1]}  (each token maps to a 768-dim vector)")
 print(f"Parameters saved by tying: {wte.numel():,}  (one copy instead of two)")
